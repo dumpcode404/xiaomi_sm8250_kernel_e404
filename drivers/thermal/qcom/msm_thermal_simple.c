@@ -13,8 +13,6 @@
 #include <linux/slab.h>
 #include <linux/thermal.h>
 
-extern atomic_t switch_mode;
-
 #define OF_READ_U32(node, prop, dst)						\
 ({										\
 	int ret = of_property_read_u32(node, prop, &(dst));			\
@@ -25,7 +23,6 @@ extern atomic_t switch_mode;
 
 struct thermal_zone {
 	u32 gold_khz;
-	u32 prime_khz;
 	u32 silver_khz;
 	s32 trip_deg;
 };
@@ -52,8 +49,6 @@ static void update_online_cpu_policy(void)
 				cpufreq_update_policy(cpu);
 			if (cpumask_intersects(cpumask_of(cpu), cpu_perf_mask))
 				cpufreq_update_policy(cpu);
-			if (cpumask_intersects(cpumask_of(cpu), cpu_prime_mask))
-				cpufreq_update_policy(cpu);
 		}
 	}
 	put_online_cpus();
@@ -64,36 +59,10 @@ static void thermal_throttle_worker(struct work_struct *work)
 	struct thermal_drv *t = container_of(to_delayed_work(work), typeof(*t),
 					     throttle_work);
 	struct thermal_zone *new_zone, *old_zone;
-	int temp = 0, temp_gpu = 0;
-	s64 temp_total = 0, temp_avg = 0;
+	int temp = 0, temp_avg = 0;
+	s64 temp_total = 0;
 	short i = 0;
 
-	/* Skip throttling entirely during the first 120s of boot */
-	if (unlikely(ktime_get_boot_ns() < 120ULL * NSEC_PER_SEC)) {
-		old_zone = t->curr_zone;
-		if (old_zone) {
-			t->curr_zone = NULL;
-			update_online_cpu_policy();
-			pr_info("boot grace period, restoring CPU freqs\n");
-		}
-		queue_delayed_work(t->wq, &t->throttle_work, t->poll_jiffies);
-		return;
-	}
-
-	/* If userspace thermal is active, disable msm_thermal_simple */
-	if (atomic_read(&switch_mode) != 0) {
-		old_zone = t->curr_zone;
-		if (old_zone) {
-			t->curr_zone = NULL;
-			update_online_cpu_policy();
-			pr_info("disabled by sconfig (%d), restoring CPU freqs\n",
-				atomic_read(&switch_mode));
-		}
-		queue_delayed_work(t->wq, &t->throttle_work, t->poll_jiffies);
-		return;
-	}
-
-	/* Store average temperature of all CPU cores */
 	for (i; i < NR_CPUS; i++) {
 		char zone_name[15];
 		sprintf(zone_name, "cpu-1-%i-usr", i);
@@ -103,27 +72,6 @@ static void thermal_throttle_worker(struct work_struct *work)
 
 	temp_avg = temp_total / NR_CPUS;
 
-	/* Checking GPU temperature */
-	thermal_zone_get_temp(thermal_zone_get_zone_by_name("gpuss-0-usr"), &temp_gpu);
-
-	/* (Number of CPUs * 8) + current temp of the GPU,
-	   this will add an overlay on top of the current cpu
-	   temperature and make the thermal_simple driver set 
-	   a zone above the one it should, decreasing temps in
-	   games or GPU heavy tasks while maintaining good CPU
-	   performance in CPU only tasks */
-
-	if (temp_gpu >= 71000)
-		/* GPU started to get hot, using base values
-		   so throttling is not so agressive at this point. */
-		temp_avg = (temp_total + 35000) / NR_CPUS;
-	else if (temp_gpu >= 73000)
-		temp_avg = (temp_total + 55000) / NR_CPUS;
-	else if (temp_gpu >= 76000)
-		temp_avg = (temp_total + 65000) / NR_CPUS;
-	else if (temp_gpu >= 78000)
-		temp_avg = (temp_total + temp_gpu) / NR_CPUS;
-		
 	old_zone = t->curr_zone;
 	new_zone = NULL;
 
@@ -136,15 +84,7 @@ static void thermal_throttle_worker(struct work_struct *work)
 
 	/* Update thermal zone if it changed */
 	if (new_zone != old_zone) {
-		if (!old_zone && new_zone)
-			pr_info("enabled, throttling at temp_avg: %i, temp_gpu: %i\n",
-				temp_avg, temp_gpu);
-		else if (old_zone && !new_zone)
-			pr_info("throttle cleared, temp_avg: %i, temp_gpu: %i\n",
-				temp_avg, temp_gpu);
-		else
-			pr_info("zone changed, temp_avg: %i, temp_gpu: %i\n",
-				temp_avg, temp_gpu);
+		pr_info("temp: %i\n", temp_avg);
 		t->curr_zone = new_zone;
 		update_online_cpu_policy();
 	}
@@ -156,10 +96,8 @@ static u32 get_throttle_freq(struct thermal_zone *zone, u32 cpu)
 {
 	if (cpumask_test_cpu(cpu, cpu_lp_mask))
 		return zone->silver_khz;
-	else if (cpumask_test_cpu(cpu, cpu_perf_mask))
-		return zone->gold_khz;
 
-	return zone->prime_khz;
+	return zone->gold_khz;
 }
 
 static int cpu_notifier_cb(struct notifier_block *nb, unsigned long val,
@@ -173,7 +111,7 @@ static int cpu_notifier_cb(struct notifier_block *nb, unsigned long val,
 		return NOTIFY_OK;
 
 	zone = t->curr_zone;
-	if (zone && atomic_read(&switch_mode) == 0)
+	if (zone)
 		policy->max = get_throttle_freq(zone, policy->cpu);
 	else
 		policy->max = policy->user_policy.max;
@@ -231,10 +169,6 @@ static int msm_thermal_simple_parse_dt(struct platform_device *pdev,
 		if (ret)
 			goto free_zones;
 
-		ret = OF_READ_U32(child, "qcom,prime-khz", zone->prime_khz);
-		if (ret)
-			goto free_zones;
-
 		ret = OF_READ_U32(child, "qcom,trip-deg", zone->trip_deg);
 		if (ret)
 			goto free_zones;
@@ -279,12 +213,6 @@ static int msm_thermal_simple_probe(struct platform_device *pdev)
 	/* Fire up the persistent worker */
 	INIT_DELAYED_WORK(&t->throttle_work, thermal_throttle_worker);
 	queue_delayed_work(t->wq, &t->throttle_work, t->start_delay * HZ);
-
-	if (atomic_read(&switch_mode) != 0)
-		pr_info("sconfig=%d, starting in passive mode\n",
-			atomic_read(&switch_mode));
-	else
-		pr_info("sconfig=0, starting in active mode\n");
 
 	return 0;
 
